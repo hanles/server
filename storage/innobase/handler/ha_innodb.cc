@@ -2768,6 +2768,22 @@ ha_innobase::update_thd()
 	update_thd(thd);
 }
 
+
+/**
+  Free a independent transaction object.
+*/
+
+void
+innobase_free_transaction(handlerton *hton, THD *thd)
+{
+  if (trx_t *trx= thd_to_trx(thd))
+  {
+    trx_free(trx);
+    thd_set_ha_data(thd, hton, nullptr);
+  }
+}
+
+
 /*********************************************************************//**
 Registers an InnoDB transaction with the MySQL 2PC coordinator, so that
 the MySQL XA code knows to call the InnoDB prepare and commit, or rollback
@@ -3929,6 +3945,7 @@ static int innodb_init(void* p)
 	innobase_hton->commit_by_xid = innobase_commit_by_xid;
 	innobase_hton->rollback_by_xid = innobase_rollback_by_xid;
 	innobase_hton->commit_checkpoint_request=innobase_checkpoint_request;
+        innobase_hton->free_transaction= innobase_free_transaction;
 	innobase_hton->create = innobase_create_handler;
 
 	innobase_hton->drop_database = innobase_drop_database;

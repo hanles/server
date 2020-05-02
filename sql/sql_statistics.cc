@@ -230,17 +230,17 @@ index_stat_def= {INDEX_STAT_N_FIELDS, index_stat_fields, 4, index_stat_pk_col};
   Open all statistical tables and lock them
 */
 
-static int open_stat_tables(THD *thd, TABLE_LIST *tables,
-                            Open_tables_backup *backup, bool for_write)
+static int open_stat_tables(THD *thd, TABLE_LIST *tables, bool for_write)
 {
   int rc;
-
   Dummy_error_handler deh; // suppress errors
+  DBUG_ASSERT(thd->transaction != &thd->default_transaction);
+
   thd->push_internal_handler(&deh);
   init_table_list_for_stat_tables(tables, for_write);
   init_mdl_requests(tables);
   thd->in_sub_stmt|= SUB_STMT_STAT_TABLES;
-  rc= open_system_tables_for_read(thd, tables, backup);
+  rc= open_system_tables_for_read(thd, tables);
   thd->in_sub_stmt&= ~SUB_STMT_STAT_TABLES;
   thd->pop_internal_handler();
 
@@ -253,7 +253,7 @@ static int open_stat_tables(THD *thd, TABLE_LIST *tables,
        stat_table_intact.check(tables[COLUMN_STAT].table, &column_stat_def) ||
        stat_table_intact.check(tables[INDEX_STAT].table, &index_stat_def)))
   {
-    close_system_tables(thd, backup);
+    close_thread_tables(thd);
     rc= 1;
   }
 
@@ -270,13 +270,12 @@ static int open_stat_tables(THD *thd, TABLE_LIST *tables,
   stat tables need to be adjusted accordingly.
 */
 static inline int open_stat_table_for_ddl(THD *thd, TABLE_LIST *table,
-                                         const LEX_CSTRING *stat_tab_name,
-                                         Open_tables_backup *backup)
+                                          const LEX_CSTRING *stat_tab_name)
 {
   table->init_one_table(&MYSQL_SCHEMA_NAME, stat_tab_name, NULL, TL_WRITE);
   No_such_table_error_handler nst_handler;
   thd->push_internal_handler(&nst_handler);
-  int res= open_system_tables_for_read(thd, table, backup);
+  int res= open_system_tables_for_read(thd, table);
   thd->pop_internal_handler();
   return res;
 }
@@ -2874,18 +2873,18 @@ int collect_statistics_for_table(THD *thd, TABLE *table)
 int update_statistics_for_table(THD *thd, TABLE *table)
 {
   TABLE_LIST tables[STATISTICS_TABLES];
-  Open_tables_backup open_tables_backup;
   uint i;
   int err;
   enum_binlog_format save_binlog_format;
   int rc= 0;
   TABLE *stat_table;
-
   DBUG_ENTER("update_statistics_for_table");
 
   DEBUG_SYNC(thd, "statistics_update_start");
 
-  if (open_stat_tables(thd, tables, &open_tables_backup, TRUE))
+  start_new_trans new_trans(thd);
+
+  if (open_stat_tables(thd, tables, TRUE))
     DBUG_RETURN(rc);
    
   save_binlog_format= thd->set_current_stmt_binlog_format_stmt();
@@ -2935,8 +2934,9 @@ int update_statistics_for_table(THD *thd, TABLE *table)
   }
 
   thd->restore_stmt_binlog_format(save_binlog_format);
-
-  close_system_tables(thd, &open_tables_backup);
+  if (thd->commit_whole_transaction_and_close_tables())
+    rc= 1;
+  new_trans.restore_old_transaction();
 
   DBUG_RETURN(rc);
 }
@@ -3290,7 +3290,6 @@ int read_statistics_for_tables_if_needed(THD *thd, TABLE_LIST *tables)
 int read_statistics_for_tables(THD *thd, TABLE_LIST *tables)
 {
   TABLE_LIST stat_tables[STATISTICS_TABLES];
-  Open_tables_backup open_tables_backup;
 
   DBUG_ENTER("read_statistics_for_tables");
 
@@ -3331,7 +3330,9 @@ int read_statistics_for_tables(THD *thd, TABLE_LIST *tables)
   if (!statistics_for_tables_is_needed(thd, tables))
     DBUG_RETURN(0);
 
-  if (open_stat_tables(thd, stat_tables, &open_tables_backup, FALSE))
+  start_new_trans new_trans(thd);
+
+  if (open_stat_tables(thd, stat_tables, FALSE))
     DBUG_RETURN(1);
 
   for (TABLE_LIST *tl= tables; tl; tl= tl->next_global)
@@ -3363,7 +3364,8 @@ int read_statistics_for_tables(THD *thd, TABLE_LIST *tables)
     }
   }  
 
-  close_system_tables(thd, &open_tables_backup);
+  thd->commit_whole_transaction_and_close_tables();
+  new_trans.restore_old_transaction();
 
   DBUG_RETURN(0);
 }
@@ -3403,8 +3405,10 @@ int delete_statistics_for_table(THD *thd, const LEX_CSTRING *db,
   Open_tables_backup open_tables_backup;
   int rc= 0;
   DBUG_ENTER("delete_statistics_for_table");
+
+  start_new_trans new_trans(thd);
    
-  if (open_stat_tables(thd, tables, &open_tables_backup, TRUE))
+  if (open_stat_tables(thd, tables, TRUE))
     DBUG_RETURN(0);
 
   save_binlog_format= thd->set_current_stmt_binlog_format_stmt();
@@ -3447,8 +3451,8 @@ int delete_statistics_for_table(THD *thd, const LEX_CSTRING *db,
       rc= 1;
 
   thd->restore_stmt_binlog_format(save_binlog_format);
-
-  close_system_tables(thd, &open_tables_backup);
+  thd->commit_whole_transaction_and_close_tables();
+  new_trans.restore_old_transaction();
 
   DBUG_RETURN(rc);
 }
@@ -3480,12 +3484,12 @@ int delete_statistics_for_column(THD *thd, TABLE *tab, Field *col)
   enum_binlog_format save_binlog_format;
   TABLE *stat_table;
   TABLE_LIST tables;
-  Open_tables_backup open_tables_backup;
   int rc= 0;
   DBUG_ENTER("delete_statistics_for_column");
    
-  if (open_stat_table_for_ddl(thd, &tables, &stat_table_name[1],
-                             &open_tables_backup))
+  start_new_trans new_trans(thd);
+
+  if (open_stat_table_for_ddl(thd, &tables, &stat_table_name[1]))
     DBUG_RETURN(0);
 
   save_binlog_format= thd->set_current_stmt_binlog_format_stmt();
@@ -3501,8 +3505,9 @@ int delete_statistics_for_column(THD *thd, TABLE *tab, Field *col)
   }
 
   thd->restore_stmt_binlog_format(save_binlog_format);
-
-  close_system_tables(thd, &open_tables_backup);
+  if (thd->commit_whole_transaction_and_close_tables())
+    rc= 1;
+  new_trans.restore_old_transaction();
 
   DBUG_RETURN(rc);
 }
@@ -3537,12 +3542,12 @@ int delete_statistics_for_index(THD *thd, TABLE *tab, KEY *key_info,
   enum_binlog_format save_binlog_format;
   TABLE *stat_table;
   TABLE_LIST tables;
-  Open_tables_backup open_tables_backup;
   int rc= 0;
   DBUG_ENTER("delete_statistics_for_index");
    
-  if (open_stat_table_for_ddl(thd, &tables, &stat_table_name[2],
-			     &open_tables_backup))
+  start_new_trans new_trans(thd);
+
+  if (open_stat_table_for_ddl(thd, &tables, &stat_table_name[2]))
     DBUG_RETURN(0);
 
   save_binlog_format= thd->set_current_stmt_binlog_format_stmt();
@@ -3578,8 +3583,9 @@ int delete_statistics_for_index(THD *thd, TABLE *tab, KEY *key_info,
     rc= 1;
 
   thd->restore_stmt_binlog_format(save_binlog_format);
-
-  close_system_tables(thd, &open_tables_backup);
+  if (thd->commit_whole_transaction_and_close_tables())
+    rc= 1;
+  new_trans.restore_old_transaction();
 
   DBUG_RETURN(rc);
 }
@@ -3621,14 +3627,13 @@ int rename_table_in_stat_tables(THD *thd, const LEX_CSTRING *db,
   enum_binlog_format save_binlog_format;
   TABLE *stat_table;
   TABLE_LIST tables[STATISTICS_TABLES];
-  Open_tables_backup open_tables_backup;
   int rc= 0;
   DBUG_ENTER("rename_table_in_stat_tables");
    
-  if (open_stat_tables(thd, tables, &open_tables_backup, TRUE))
-  {
+  start_new_trans new_trans(thd);
+
+  if (open_stat_tables(thd, tables, TRUE))
     DBUG_RETURN(0); // not an error
-  }
 
   save_binlog_format= thd->set_current_stmt_binlog_format_stmt();
 
@@ -3677,8 +3682,9 @@ int rename_table_in_stat_tables(THD *thd, const LEX_CSTRING *db,
   }
 
   thd->restore_stmt_binlog_format(save_binlog_format);
-
-  close_system_tables(thd, &open_tables_backup);
+  if (thd->commit_whole_transaction_and_close_tables())
+    rc= 1;
+  new_trans.restore_old_transaction();
 
   DBUG_RETURN(rc);
 }
@@ -3711,15 +3717,15 @@ int rename_column_in_stat_tables(THD *thd, TABLE *tab, Field *col,
   enum_binlog_format save_binlog_format;
   TABLE *stat_table;
   TABLE_LIST tables;
-  Open_tables_backup open_tables_backup;
   int rc= 0;
   DBUG_ENTER("rename_column_in_stat_tables");
   
   if (tab->s->tmp_table != NO_TMP_TABLE)
     DBUG_RETURN(0);
 
-  if (open_stat_table_for_ddl(thd, &tables, &stat_table_name[1],
-                             &open_tables_backup))
+  start_new_trans new_trans(thd);
+
+  if (open_stat_table_for_ddl(thd, &tables, &stat_table_name[1]))
     DBUG_RETURN(rc);
 
   save_binlog_format= thd->set_current_stmt_binlog_format_stmt();
@@ -3736,8 +3742,9 @@ int rename_column_in_stat_tables(THD *thd, TABLE *tab, Field *col,
   }
 
   thd->restore_stmt_binlog_format(save_binlog_format);
-
-  close_system_tables(thd, &open_tables_backup);
+  if (thd->commit_whole_transaction_and_close_tables())
+    rc= 1;
+  new_trans.restore_old_transaction();
 
   DBUG_RETURN(rc);
 }

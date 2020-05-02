@@ -1701,7 +1701,7 @@ int binlog_init(void *p)
     // recover needs to be set to make xa{commit,rollback}_handlerton effective
     binlog_hton->recover= binlog_xa_recover_dummy;
   }
-  binlog_hton->flags= HTON_NOT_USER_SELECTABLE | HTON_HIDDEN;
+  binlog_hton->flags= HTON_NOT_USER_SELECTABLE | HTON_HIDDEN | HTON_NO_ROLLBACK;
   return 0;
 }
 
@@ -5609,7 +5609,8 @@ trans_has_updated_trans_table(const THD* thd)
 
   @param thd The client thread that executed the current statement.
   @return
-    @c true if a transactional table was updated, @c false otherwise.
+    @c true if a transactional table with rollback was updated,
+    @c false otherwise.
 */
 bool
 stmt_has_updated_trans_table(const THD *thd)
@@ -5619,7 +5620,8 @@ stmt_has_updated_trans_table(const THD *thd)
   for (ha_info= thd->transaction->stmt.ha_list; ha_info;
        ha_info= ha_info->next())
   {
-    if (ha_info->is_trx_read_write() && ha_info->ht() != binlog_hton)
+    if (ha_info->is_trx_read_write() &&
+        !(ha_info->ht()->flags & HTON_NO_ROLLBACK))
       return (TRUE);
   }
   return (FALSE);
