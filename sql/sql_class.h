@@ -5955,22 +5955,6 @@ inline bool binlog_should_compress(ulong len)
     len >= opt_bin_log_compress_min_len;
 }
 
-
-/**
-   Save thd sql_mode on instantiation.
-   On destruction it resets the mode to the previously stored value.
-*/
-class Sql_mode_save
-{
- public:
-  Sql_mode_save(THD *thd) : thd(thd), old_mode(thd->variables.sql_mode) {}
-  ~Sql_mode_save() { thd->variables.sql_mode = old_mode; }
-
- private:
-  THD *thd;
-  sql_mode_t old_mode; // SQL mode saved at construction time.
-};
-
 class Switch_to_definer_security_ctx
 {
  public:

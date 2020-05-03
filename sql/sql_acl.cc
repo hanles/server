@@ -54,6 +54,7 @@
 #include "sql_array.h"
 #include "sql_hset.h"
 #include "password.h"
+#include "scope.h"
 
 #include "sql_plugin_compat.h"
 
@@ -1856,10 +1857,10 @@ static bool acl_load(THD *thd, const Grant_tables& tables)
   bool check_no_resolve= specialflag & SPECIAL_NO_RESOLVE;
   char tmp_name[SAFE_NAME_LEN+1];
   int password_length;
-  Sql_mode_save old_mode_save(thd);
+  maria::Scope_value<ulonglong> sql_mode(thd->variables.sql_mode,
+                                         thd->variables.sql_mode &
+                                             ~MODE_PAD_CHAR_TO_FULL_LENGTH);
   DBUG_ENTER("acl_load");
-
-  thd->variables.sql_mode&= ~MODE_PAD_CHAR_TO_FULL_LENGTH;
 
   grant_version++; /* Privileges updated */
 
