@@ -523,6 +523,13 @@ enum ha_base_keytype {
 #define HA_ERR_TABLESPACE_MISSING 194  /* Missing Tablespace */
 #define HA_ERR_SEQUENCE_INVALID_DATA 195
 #define HA_ERR_SEQUENCE_RUN_OUT   196
+
+/*
+  Share the error code to not increment the HA_ERR_LAST for now,
+  as it disturbs some storage engine's tests.
+  Probably should be fixed later.
+*/
+#define HA_ERR_INVALID_JSON       HA_ERR_TABLE_IN_FK_CHECK
 #define HA_ERR_LAST               196  /* Copy of last error nr * */
 
 /* Number of different errors */

@@ -559,10 +559,12 @@ int ha_finalize_handlerton(st_plugin_int *plugin)
 }
 
 
+const char *hton_no_exts[]= { 0 };
+
+
 int ha_initialize_handlerton(st_plugin_int *plugin)
 {
   handlerton *hton;
-  static const char *no_exts[]= { 0 };
   DBUG_ENTER("ha_initialize_handlerton");
   DBUG_PRINT("plugin", ("initialize plugin: '%s'", plugin->name.str));
 
@@ -575,7 +577,7 @@ int ha_initialize_handlerton(st_plugin_int *plugin)
     goto err_no_hton_memory;
   }
 
-  hton->tablefile_extensions= no_exts;
+  hton->tablefile_extensions= hton_no_exts;
   hton->discover_table_names= hton_ext_based_table_discovery;
 
   hton->slot= HA_SLOT_UNDEF;
@@ -4114,6 +4116,10 @@ void handler::print_error(int error, myf errflag)
   case HA_ERR_UNDO_REC_TOO_BIG:
     textno= ER_UNDO_RECORD_TOO_BIG;
     break;
+  /*
+    Now codes are same, but can be changed.
+    case HA_ERR_INVALID_JSON:
+  */
   case HA_ERR_TABLE_IN_FK_CHECK:
     textno= ER_TABLE_IN_FK_CHECK;
     break;

@@ -1991,6 +1991,128 @@ int show_create_table(THD *thd, TABLE_LIST *table_list, String *packet,
                               create_info_arg, with_db_name);
 }
 
+int Field::print(THD *thd, TABLE_SHARE *share, String *packet,
+                 bool check_options, handlerton *hton)
+{
+  char tmp[MAX_FIELD_WIDTH];
+  String type(tmp, sizeof(tmp), system_charset_info);
+  String def_value;
+  sql_mode_t sql_mode= thd->variables.sql_mode;
+  bool limited_mysql_mode= sql_mode & (MODE_NO_FIELD_OPTIONS | MODE_MYSQL323 |
+                                       MODE_MYSQL40);
+
+  append_identifier(thd, packet, &field_name);
+  packet->append(' ');
+
+  type.set(tmp, sizeof(tmp), system_charset_info);
+  sql_type(type);
+  packet->append(type.ptr(), type.length(), system_charset_info);
+
+  if (has_charset() && !(sql_mode & (MODE_MYSQL323 | MODE_MYSQL40)))
+  {
+    if (charset() != share->table_charset)
+    {
+      packet->append(STRING_WITH_LEN(" CHARACTER SET "));
+      packet->append(charset()->csname);
+    }
+    /*
+      For string types dump collation name only if
+      collation is not primary for the given charset
+    */
+    if (!(charset()->state & MY_CS_PRIMARY) && !vcol_info)
+    {
+      packet->append(STRING_WITH_LEN(" COLLATE "));
+      packet->append(charset()->name);
+    }
+  }
+
+  if (vcol_info)
+  {
+    StringBuffer<MAX_FIELD_WIDTH> str(&my_charset_utf8mb4_general_ci);
+    vcol_info->print(&str);
+    packet->append(STRING_WITH_LEN(" GENERATED ALWAYS AS ("));
+    packet->append(str);
+    packet->append(STRING_WITH_LEN(")"));
+    if (vcol_info->stored_in_db)
+      packet->append(STRING_WITH_LEN(" STORED"));
+    else
+      packet->append(STRING_WITH_LEN(" VIRTUAL"));
+    if (invisible == INVISIBLE_USER)
+    {
+      packet->append(STRING_WITH_LEN(" INVISIBLE"));
+    }
+  }
+  else
+  {
+    if (flags & VERS_SYS_START_FLAG)
+    {
+      packet->append(STRING_WITH_LEN(" GENERATED ALWAYS AS ROW START"));
+    }
+    else if (flags & VERS_SYS_END_FLAG)
+    {
+      packet->append(STRING_WITH_LEN(" GENERATED ALWAYS AS ROW END"));
+    }
+    else if (flags & NOT_NULL_FLAG)
+      packet->append(STRING_WITH_LEN(" NOT NULL"));
+    else if (this->type() == MYSQL_TYPE_TIMESTAMP)
+    {
+      /*
+        TIMESTAMP field require explicit NULL flag, because unlike
+        all other fields they are treated as NOT NULL by default.
+      */
+      packet->append(STRING_WITH_LEN(" NULL"));
+    }
+
+    if (invisible == INVISIBLE_USER)
+    {
+      packet->append(STRING_WITH_LEN(" INVISIBLE"));
+    }
+    def_value.set(tmp, sizeof(tmp), system_charset_info);
+    if (get_field_default_value(thd, this, &def_value, 1))
+    {
+      packet->append(STRING_WITH_LEN(" DEFAULT "));
+      packet->append(def_value.ptr(), def_value.length(), system_charset_info);
+    }
+
+    if (vers_update_unversioned())
+    {
+      packet->append(STRING_WITH_LEN(" WITHOUT SYSTEM VERSIONING"));
+    }
+
+    if (!limited_mysql_mode &&
+        print_on_update_clause(this, &def_value, false))
+    {
+      packet->append(STRING_WITH_LEN(" "));
+      packet->append(def_value);
+    }
+
+    if (unireg_check == Field::NEXT_NUMBER &&
+        !(sql_mode & MODE_NO_FIELD_OPTIONS))
+      packet->append(STRING_WITH_LEN(" AUTO_INCREMENT"));
+  }
+
+  if (comment.length)
+  {
+    packet->append(STRING_WITH_LEN(" COMMENT "));
+    append_unescaped(packet, comment.str, comment.length);
+  }
+
+  append_create_options(thd, packet, option_list, check_options,
+                        hton->field_options);
+
+  if (check_constraint)
+  {
+    StringBuffer<MAX_FIELD_WIDTH> str(&my_charset_utf8mb4_general_ci);
+    check_constraint->print(&str);
+    packet->append(STRING_WITH_LEN(" CHECK ("));
+    packet->append(str);
+    packet->append(STRING_WITH_LEN(")"));
+  }
+
+  return 0;
+}
+
+
 /*
   Build a CREATE TABLE statement for a table.
 
@@ -2027,10 +2149,8 @@ int show_create_table_ex(THD *thd, TABLE_LIST *table_list,
                          enum_with_db_name with_db_name)
 {
   List<Item> field_list;
-  char tmp[MAX_FIELD_WIDTH], *for_str, def_value_buf[MAX_FIELD_WIDTH];
+  char *for_str;
   LEX_CSTRING alias;
-  String type;
-  String def_value;
   Field **ptr,*field;
   uint primary_key;
   KEY *key_info;
@@ -2042,8 +2162,6 @@ int show_create_table_ex(THD *thd, TABLE_LIST *table_list,
   bool foreign_db_mode=  sql_mode & (MODE_POSTGRESQL | MODE_ORACLE |
                                      MODE_MSSQL | MODE_DB2 |
                                      MODE_MAXDB | MODE_ANSI);
-  bool limited_mysql_mode= sql_mode & (MODE_NO_FIELD_OPTIONS | MODE_MYSQL323 |
-                                       MODE_MYSQL40);
   bool show_table_options= !(sql_mode & MODE_NO_TABLE_OPTIONS) &&
                            !foreign_db_mode;
   bool check_options= !(sql_mode & MODE_IGNORE_BAD_TABLE_OPTIONS) &&
@@ -2134,9 +2252,6 @@ int show_create_table_ex(THD *thd, TABLE_LIST *table_list,
   bool not_the_first_field= false;
   for (ptr=table->field ; (field= *ptr); ptr++)
   {
-
-    uint flags = field->flags;
-
     if (field->invisible > INVISIBLE_USER)
        continue;
     if (not_the_first_field)
@@ -2144,114 +2259,8 @@ int show_create_table_ex(THD *thd, TABLE_LIST *table_list,
 
     not_the_first_field= true;
     packet->append(STRING_WITH_LEN("  "));
-    append_identifier(thd, packet, &field->field_name);
-    packet->append(' ');
 
-    type.set(tmp, sizeof(tmp), system_charset_info);
-    field->sql_type(type);
-    packet->append(type.ptr(), type.length(), system_charset_info);
-
-    if (field->has_charset() && !(sql_mode & (MODE_MYSQL323 | MODE_MYSQL40)))
-    {
-      if (field->charset() != share->table_charset)
-      {
-	packet->append(STRING_WITH_LEN(" CHARACTER SET "));
-	packet->append(field->charset()->csname);
-      }
-      /*
-	For string types dump collation name only if
-	collation is not primary for the given charset
-      */
-      if (!(field->charset()->state & MY_CS_PRIMARY) && !field->vcol_info)
-      {
-	packet->append(STRING_WITH_LEN(" COLLATE "));
-	packet->append(field->charset()->name);
-      }
-    }
-
-    if (field->vcol_info)
-    {
-      StringBuffer<MAX_FIELD_WIDTH> str(&my_charset_utf8mb4_general_ci);
-      field->vcol_info->print(&str);
-      packet->append(STRING_WITH_LEN(" GENERATED ALWAYS AS ("));
-      packet->append(str);
-      packet->append(STRING_WITH_LEN(")"));
-      if (field->vcol_info->stored_in_db)
-        packet->append(STRING_WITH_LEN(" STORED"));
-      else
-        packet->append(STRING_WITH_LEN(" VIRTUAL"));
-      if (field->invisible == INVISIBLE_USER)
-      {
-        packet->append(STRING_WITH_LEN(" INVISIBLE"));
-      }
-    }
-    else
-    {
-      if (field->flags & VERS_SYS_START_FLAG)
-      {
-        packet->append(STRING_WITH_LEN(" GENERATED ALWAYS AS ROW START"));
-      }
-      else if (field->flags & VERS_SYS_END_FLAG)
-      {
-        packet->append(STRING_WITH_LEN(" GENERATED ALWAYS AS ROW END"));
-      }
-      else if (flags & NOT_NULL_FLAG)
-        packet->append(STRING_WITH_LEN(" NOT NULL"));
-      else if (field->type() == MYSQL_TYPE_TIMESTAMP)
-      {
-        /*
-          TIMESTAMP field require explicit NULL flag, because unlike
-          all other fields they are treated as NOT NULL by default.
-        */
-        packet->append(STRING_WITH_LEN(" NULL"));
-      }
-
-      if (field->invisible == INVISIBLE_USER)
-      {
-        packet->append(STRING_WITH_LEN(" INVISIBLE"));
-      }
-      def_value.set(def_value_buf, sizeof(def_value_buf), system_charset_info);
-      if (get_field_default_value(thd, field, &def_value, 1))
-      {
-        packet->append(STRING_WITH_LEN(" DEFAULT "));
-        packet->append(def_value.ptr(), def_value.length(), system_charset_info);
-      }
-
-      if (field->vers_update_unversioned())
-      {
-        packet->append(STRING_WITH_LEN(" WITHOUT SYSTEM VERSIONING"));
-      }
-
-      if (!limited_mysql_mode &&
-          print_on_update_clause(field, &def_value, false))
-      {
-        packet->append(STRING_WITH_LEN(" "));
-        packet->append(def_value);
-      }
-
-      if (field->unireg_check == Field::NEXT_NUMBER &&
-          !(sql_mode & MODE_NO_FIELD_OPTIONS))
-        packet->append(STRING_WITH_LEN(" AUTO_INCREMENT"));
-    }
-
-    if (field->comment.length)
-    {
-      packet->append(STRING_WITH_LEN(" COMMENT "));
-      append_unescaped(packet, field->comment.str, field->comment.length);
-    }
-
-    append_create_options(thd, packet, field->option_list, check_options,
-                          hton->field_options);
-    
-    if (field->check_constraint)
-    {
-      StringBuffer<MAX_FIELD_WIDTH> str(&my_charset_utf8mb4_general_ci);
-      field->check_constraint->print(&str);
-      packet->append(STRING_WITH_LEN(" CHECK ("));
-      packet->append(str);
-      packet->append(STRING_WITH_LEN(")"));
-    }
-
+    (void) field->print(thd, share, packet, check_options, hton);
   }
 
   if (period.name)

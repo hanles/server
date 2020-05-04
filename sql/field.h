@@ -1573,6 +1573,8 @@ public:
                    int cuted_increment, ulong current_row=0) const;
   virtual void print_key_value(String *out, uint32 length);
   void print_key_value_binary(String *out, const uchar* key, uint32 length);
+  int print(THD *thd, TABLE_SHARE *share, String *packet,
+            bool check_options, handlerton *hton);
 protected:
   bool set_warning(unsigned int code, int cuted_increment) const
   {
