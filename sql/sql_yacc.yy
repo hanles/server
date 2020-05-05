@@ -15736,6 +15736,7 @@ keyword_sp_var_and_label:
         | DYNAMIC_SYM
         | ELSEIF_ORACLE_SYM
         | ELSIF_MARIADB_SYM
+        | EMPTY_SYM
         | ENDS_SYM
         | ENGINE_SYM
         | ENGINES_SYM
@@ -16058,7 +16059,6 @@ reserved_keyword_udt_not_param_type:
         | ELSE
         | ELSEIF_MARIADB_SYM
         | ELSIF_ORACLE_SYM
-        | EMPTY_SYM
         | ENCLOSED
         | ESCAPED
         | EXCEPT_SYM
