@@ -24,6 +24,7 @@
 #include <mysql/plugin.h>
 #include <mysql/service_thd_wait.h>
 #include <mysql/psi/mysql_stage.h>
+#include <algorithm>
 #ifdef HAVE_PSI_INTERFACE
 static PSI_mutex_key key_MDL_wait_LOCK_wait_status;
 
@@ -327,30 +328,26 @@ public:
   class Ticket_list
   {
   public:
-    typedef I_P_List<MDL_ticket,
-                     I_P_List_adapter<MDL_ticket,
-                                      &MDL_ticket::next_in_lock,
-                                      &MDL_ticket::prev_in_lock>,
-                     I_P_List_null_counter,
-                     I_P_List_fast_push_back<MDL_ticket> >
-            List;
-    operator const List &() const { return m_list; }
+    using List= intrusive::list<MDL_ticket>;
+
     Ticket_list() :m_bitmap(0) {}
 
     void add_ticket(MDL_ticket *ticket);
     void remove_ticket(MDL_ticket *ticket);
-    bool is_empty() const { return m_list.is_empty(); }
+    bool is_empty() const { return m_list.empty(); }
     bitmap_t bitmap() const { return m_bitmap; }
+    List::iterator begin() { return m_list.begin(); }
+    List::iterator end() { return m_list.end(); }
+    List::const_iterator begin() const { return m_list.begin(); }
+    List::const_iterator end() const { return m_list.end(); }
   private:
     void clear_bit_if_not_in_list(enum_mdl_type type);
   private:
     /** List of tickets. */
-    List m_list;
+    intrusive::list<MDL_ticket> m_list;
     /** Bitmap of types of tickets in this list. */
     bitmap_t m_bitmap;
   };
-
-  typedef Ticket_list::List::Iterator Ticket_iterator;
 
 
   /**
@@ -560,14 +557,12 @@ public:
   { return m_strategy->needs_notification(ticket); }
   void notify_conflicting_locks(MDL_context *ctx)
   {
-    Ticket_iterator it(m_granted);
-    MDL_ticket *conflicting_ticket;
-    while ((conflicting_ticket= it++))
+    for (const auto& conflicting_ticket : m_granted)
     {
-      if (conflicting_ticket->get_ctx() != ctx &&
-          m_strategy->conflicting_locks(conflicting_ticket))
+      if (conflicting_ticket.get_ctx() != ctx &&
+          m_strategy->conflicting_locks(&conflicting_ticket))
       {
-        MDL_context *conflicting_ctx= conflicting_ticket->get_ctx();
+        MDL_context *conflicting_ctx= conflicting_ticket.get_ctx();
 
         ctx->get_owner()->
           notify_shared_lock(conflicting_ctx->get_owner(),
@@ -715,13 +710,18 @@ static my_bool mdl_iterate_lock(MDL_lock *lock, mdl_iterate_arg *arg)
     must be empty for such locks anyway.
   */
   mysql_prlock_rdlock(&lock->m_rwlock);
-  MDL_lock::Ticket_iterator granted_it(lock->m_granted);
-  MDL_lock::Ticket_iterator waiting_it(lock->m_waiting);
-  MDL_ticket *ticket;
-  while ((ticket= granted_it++) && !(res= arg->callback(ticket, arg->argument, true)))
-    /* no-op */;
-  while ((ticket= waiting_it++) && !(res= arg->callback(ticket, arg->argument, false)))
-    /* no-op */;
+  for (auto &ticket : lock->m_granted)
+  {
+    res= arg->callback(&ticket, arg->argument, true);
+    if (res)
+      break;
+  }
+  for (auto &ticket : lock->m_waiting)
+  {
+    res= arg->callback(&ticket, arg->argument, false);
+    if (res)
+      break;
+  }
   mysql_prlock_unlock(&lock->m_rwlock);
   return MY_TEST(res);
 }
@@ -1187,12 +1187,12 @@ MDL_wait::timed_wait(MDL_context_owner *owner, struct timespec *abs_timeout,
 
 void MDL_lock::Ticket_list::clear_bit_if_not_in_list(enum_mdl_type type)
 {
-  MDL_lock::Ticket_iterator it(m_list);
-  const MDL_ticket *ticket;
+  if (std::any_of(m_list.begin(), m_list.end(),
+                  [type](MDL_ticket &t) { return t.get_type() == type; }))
+  {
+    return;
+  }
 
-  while ((ticket= it++))
-    if (ticket->get_type() == type)
-      return;
   m_bitmap&= ~ MDL_BIT(type);
 }
 
@@ -1214,30 +1214,14 @@ void MDL_lock::Ticket_list::add_ticket(MDL_ticket *ticket)
   if ((this == &(ticket->get_lock()->m_waiting)) &&
       wsrep_thd_is_BF(ticket->get_ctx()->get_thd(), false))
   {
-    Ticket_iterator itw(ticket->get_lock()->m_waiting);
-    MDL_ticket *waiting;
-    MDL_ticket *prev=NULL;
-    bool added= false;
-
     DBUG_ASSERT(WSREP(ticket->get_ctx()->get_thd()));
 
-    while ((waiting= itw++) && !added)
-    {
-      if (!wsrep_thd_is_BF(waiting->get_ctx()->get_thd(), true))
-      {
-        WSREP_DEBUG("MDL add_ticket inserted before: %lu %s",
-                    thd_get_thread_id(waiting->get_ctx()->get_thd()),
-                    wsrep_thd_query(waiting->get_ctx()->get_thd()));
-        /* Insert the ticket before the first non-BF waiting thd. */
-        m_list.insert_after(prev, ticket);
-        added= true;
-      }
-      prev= waiting;
-    }
-
-    /* Otherwise, insert the ticket at the back of the waiting list. */
-    if (!added)
-      m_list.push_back(ticket);
+    m_list.insert(std::find_if(ticket->get_lock()->m_waiting.begin(),
+                               ticket->get_lock()->m_waiting.end(),
+                               [](const MDL_ticket &waiting) {
+                                 return !waiting.get_ctx()->get_thd();
+                               }),
+                  *ticket);
   }
   else
 #endif /* WITH_WSREP */
@@ -1246,7 +1230,7 @@ void MDL_lock::Ticket_list::add_ticket(MDL_ticket *ticket)
       Add ticket to the *back* of the queue to ensure fairness
       among requests with the same priority.
     */
-    m_list.push_back(ticket);
+    m_list.push_back(*ticket);
   }
   m_bitmap|= MDL_BIT(ticket->get_type());
 }
@@ -1259,7 +1243,7 @@ void MDL_lock::Ticket_list::add_ticket(MDL_ticket *ticket)
 
 void MDL_lock::Ticket_list::remove_ticket(MDL_ticket *ticket)
 {
-  m_list.remove(ticket);
+  m_list.remove(*ticket);
   /*
     Check if waiting queue has another ticket with the same type as
     one which was removed. If there is no such ticket, i.e. we have
@@ -1287,8 +1271,6 @@ void MDL_lock::Ticket_list::remove_ticket(MDL_ticket *ticket)
 
 void MDL_lock::reschedule_waiters()
 {
-  MDL_lock::Ticket_iterator it(m_waiting);
-  MDL_ticket *ticket;
   bool skip_high_priority= false;
   bitmap_t hog_lock_types= hog_lock_types_bitmap();
 
@@ -1343,20 +1325,21 @@ void MDL_lock::reschedule_waiters()
                   grant SNRW lock and there are no pending S or
                   SH locks.
   */
-  while ((ticket= it++))
+  for (auto it = m_waiting.begin(); it != m_waiting.end(); ++it)
   {
+  loop:
     /*
       Skip high-prio, strong locks if earlier we have decided to give way to
       low-prio, weaker locks.
     */
     if (skip_high_priority &&
-        ((MDL_BIT(ticket->get_type()) & hog_lock_types) != 0))
+        ((MDL_BIT(it->get_type()) & hog_lock_types) != 0))
       continue;
 
-    if (can_grant_lock(ticket->get_type(), ticket->get_ctx(),
+    if (can_grant_lock(it->get_type(), it->get_ctx(),
                        skip_high_priority))
     {
-      if (! ticket->get_ctx()->m_wait.set_status(MDL_wait::GRANTED))
+      if (!it->get_ctx()->m_wait.set_status(MDL_wait::GRANTED))
       {
         /*
           Satisfy the found request by updating lock structures.
@@ -1366,15 +1349,22 @@ void MDL_lock::reschedule_waiters()
           when manages to do so, already sees an updated state of the
           MDL_lock object.
         */
-        m_waiting.remove_ticket(ticket);
-        m_granted.add_ticket(ticket);
+        auto next_it = std::next(it);
+        m_waiting.remove_ticket(&*it);
+        m_granted.add_ticket(&*it);
 
         /*
           Increase counter of successively granted high-priority strong locks,
           if we have granted one.
         */
-        if ((MDL_BIT(ticket->get_type()) & hog_lock_types) != 0)
+        if ((MDL_BIT(it->get_type()) & hog_lock_types) != 0)
           m_hog_lock_count++;
+
+        if (next_it == m_waiting.end())
+          break;
+
+        it= next_it;
+        goto loop;
       }
       /*
         If we could not update the wait slot of the waiter,
@@ -1747,14 +1737,13 @@ MDL_lock::can_grant_lock(enum_mdl_type type_arg,
 
   if (m_granted.bitmap() & granted_incompat_map)
   {
-    Ticket_iterator it(m_granted);
     bool can_grant= true;
 
     /* Check that the incompatible lock belongs to some other context. */
-    while (auto ticket= it++)
+    for (const auto &ticket : m_granted)
     {
-      if (ticket->get_ctx() != requestor_ctx &&
-          ticket->is_incompatible_when_granted(type_arg))
+      if (ticket.get_ctx() != requestor_ctx &&
+          ticket.is_incompatible_when_granted(type_arg))
       {
         can_grant= false;
 #ifdef WITH_WSREP
@@ -1766,12 +1755,13 @@ MDL_lock::can_grant_lock(enum_mdl_type type_arg,
             requestor_ctx->get_thd()->wsrep_cs().mode() ==
             wsrep::client_state::m_rsu)
         {
-          wsrep_handle_mdl_conflict(requestor_ctx, ticket, &key);
+          wsrep_handle_mdl_conflict(requestor_ctx,
+                                    const_cast<MDL_ticket *>(&ticket), &key);
           if (wsrep_log_conflicts)
           {
-            auto key= ticket->get_key();
+            auto key= ticket.get_key();
             WSREP_INFO("MDL conflict db=%s table=%s ticket=%d solved by abort",
-                       key->db_name(), key->name(), ticket->get_type());
+                       key->db_name(), key->name(), ticket.get_type());
           }
           continue;
         }
@@ -1793,12 +1783,10 @@ MDL_lock::can_grant_lock(enum_mdl_type type_arg,
 inline unsigned long
 MDL_lock::get_lock_owner() const
 {
-  Ticket_iterator it(m_granted);
-  MDL_ticket *ticket;
+  if (m_granted.is_empty())
+    return 0;
 
-  if ((ticket= it++))
-    return ticket->get_ctx()->get_thread_id();
-  return 0;
+  return m_granted.begin()->get_ctx()->get_thread_id();
 }
 
 
@@ -2185,18 +2173,16 @@ MDL_context::clone_ticket(MDL_request *mdl_request)
 #ifndef DBUG_OFF
 bool MDL_lock::check_if_conflicting_replication_locks(MDL_context *ctx)
 {
-  Ticket_iterator it(m_granted);
-  MDL_ticket *conflicting_ticket;
   rpl_group_info *rgi_slave= ctx->get_thd()->rgi_slave;
 
   if (!rgi_slave->gtid_sub_id)
     return 0;
 
-  while ((conflicting_ticket= it++))
+  for(const auto &conflicting_ticket : m_granted)
   {
-    if (conflicting_ticket->get_ctx() != ctx)
+    if (conflicting_ticket.get_ctx() != ctx)
     {
-      MDL_context *conflicting_ctx= conflicting_ticket->get_ctx();
+      MDL_context *conflicting_ctx= conflicting_ticket.get_ctx();
       rpl_group_info *conflicting_rgi_slave;
       conflicting_rgi_slave= conflicting_ctx->get_thd()->rgi_slave;
 
@@ -2562,15 +2548,10 @@ MDL_context::upgrade_shared_lock(MDL_ticket *mdl_ticket,
 bool MDL_lock::visit_subgraph(MDL_ticket *waiting_ticket,
                               MDL_wait_for_graph_visitor *gvisitor)
 {
-  MDL_ticket *ticket;
   MDL_context *src_ctx= waiting_ticket->get_ctx();
   bool result= TRUE;
 
   mysql_prlock_rdlock(&m_rwlock);
-
-  /* Must be initialized after taking a read lock. */
-  Ticket_iterator granted_it(m_granted);
-  Ticket_iterator waiting_it(m_waiting);
 
   /*
     MDL_lock's waiting and granted queues and MDL_context::m_waiting_for
@@ -2638,46 +2619,44 @@ bool MDL_lock::visit_subgraph(MDL_ticket *waiting_ticket,
     node. In workloads that involve wait-for graph loops this
     has proven to be a more efficient strategy [citation missing].
   */
-  while ((ticket= granted_it++))
+  for (const auto& ticket : m_granted)
   {
     /* Filter out edges that point to the same node. */
-    if (ticket->get_ctx() != src_ctx &&
-        ticket->is_incompatible_when_granted(waiting_ticket->get_type()) &&
-        gvisitor->inspect_edge(ticket->get_ctx()))
+    if (ticket.get_ctx() != src_ctx &&
+        ticket.is_incompatible_when_granted(waiting_ticket->get_type()) &&
+        gvisitor->inspect_edge(ticket.get_ctx()))
     {
       goto end_leave_node;
     }
   }
 
-  while ((ticket= waiting_it++))
+  for (const auto& ticket : m_waiting)
   {
     /* Filter out edges that point to the same node. */
-    if (ticket->get_ctx() != src_ctx &&
-        ticket->is_incompatible_when_waiting(waiting_ticket->get_type()) &&
-        gvisitor->inspect_edge(ticket->get_ctx()))
+    if (ticket.get_ctx() != src_ctx &&
+        ticket.is_incompatible_when_waiting(waiting_ticket->get_type()) &&
+        gvisitor->inspect_edge(ticket.get_ctx()))
     {
       goto end_leave_node;
     }
   }
 
   /* Recurse and inspect all adjacent nodes. */
-  granted_it.rewind();
-  while ((ticket= granted_it++))
+  for (const auto& ticket : m_granted)
   {
-    if (ticket->get_ctx() != src_ctx &&
-        ticket->is_incompatible_when_granted(waiting_ticket->get_type()) &&
-        ticket->get_ctx()->visit_subgraph(gvisitor))
+    if (ticket.get_ctx() != src_ctx &&
+        ticket.is_incompatible_when_granted(waiting_ticket->get_type()) &&
+        ticket.get_ctx()->visit_subgraph(gvisitor))
     {
       goto end_leave_node;
     }
   }
 
-  waiting_it.rewind();
-  while ((ticket= waiting_it++))
+  for (const auto& ticket : m_waiting)
   {
-    if (ticket->get_ctx() != src_ctx &&
-        ticket->is_incompatible_when_waiting(waiting_ticket->get_type()) &&
-        ticket->get_ctx()->visit_subgraph(gvisitor))
+    if (ticket.get_ctx() != src_ctx &&
+        ticket.is_incompatible_when_waiting(waiting_ticket->get_type()) &&
+        ticket.get_ctx()->visit_subgraph(gvisitor))
     {
       goto end_leave_node;
     }

@@ -16,6 +16,7 @@
    51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA */
 
 #include "sql_plist.h"
+#include "intrusive_list.h"
 #include <my_sys.h>
 #include <m_string.h>
 #include <mysql_com.h>
@@ -674,7 +675,7 @@ public:
           threads/contexts.
 */
 
-class MDL_ticket : public MDL_wait_for_subgraph
+class MDL_ticket : public MDL_wait_for_subgraph, public intrusive::list_node<>
 {
 public:
   /**
@@ -683,12 +684,6 @@ public:
   */
   MDL_ticket *next_in_context;
   MDL_ticket **prev_in_context;
-  /**
-    Pointers for participating in the list of satisfied/pending requests
-    for the lock. Externally accessible.
-  */
-  MDL_ticket *next_in_lock;
-  MDL_ticket **prev_in_lock;
 public:
 #ifdef WITH_WSREP
   void wsrep_report(bool debug);
