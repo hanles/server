@@ -8689,21 +8689,14 @@ foreign_fail:
 	}
 
 	if (ctx0->num_to_drop_vcol || ctx0->num_to_add_vcol) {
+		/* FIXME: this workaround does not seem to work with
+		partitioned tables */
 		DBUG_ASSERT(ctx0->old_table->get_ref_count() == 1);
 
 		trx_commit_for_mysql(m_prebuilt->trx);
-#ifdef BTR_CUR_HASH_ADAPT
-		if (btr_search_enabled) {
-			btr_search_disable(false);
-			btr_search_enable();
-		}
-#endif /* BTR_CUR_HASH_ADAPT */
 
-		char	tb_name[FN_REFLEN];
-		ut_strcpy(tb_name, m_prebuilt->table->name.m_name);
-
-		tb_name[strlen(m_prebuilt->table->name.m_name)] = 0;
-
+		char	tb_name[NAME_LEN * 2 + 1 + 1];
+		strcpy(tb_name, m_prebuilt->table->name.m_name);
 		dict_table_close(m_prebuilt->table, true, false);
 		dict_table_remove_from_cache(m_prebuilt->table);
 		m_prebuilt->table = dict_table_open_on_name(
